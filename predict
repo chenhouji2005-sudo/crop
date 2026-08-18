@@ -1,0 +1,350 @@
+"""
+GBCA-Ensemble: Gradient Boosted Cross-Attention Ensemble Network
+Remote Sensing Agricultural Land-Cover Classification Scheme.
+
+Inference & Production Prediction Pipeline.
+
+Author: Your Name / Your Lab
+Repository: https://github.com/YourUsername/GBCA-Ensemble
+"""
+
+import os
+import gc
+import random
+import sys
+import warnings
+import argparse
+import joblib
+import logging
+import numpy as np
+import geopandas as gpd
+import rasterio
+from rasterio.features import geometry_mask
+from rasterio.windows import Window
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from tqdm import tqdm
+
+warnings.filterwarnings('ignore')
+
+# 配置全局日志
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+
+
+# ========================= 【全局配置与种子固定】 =========================
+def seed_everything(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+
+
+# ===================== GBCA_Emb 交叉注意力网络 =====================
+class GBCA_Emb_Fast(nn.Module):
+    def __init__(self, spec_dim, n_tree, max_leaf_list, emb_dim, hidden_dim, n_class, dropout, n_head):
+        super().__init__()
+        self.n_tree = n_tree
+        self.emb_dim = emb_dim
+
+        leaf_counts = np.array(max_leaf_list, dtype=np.int64)
+        offsets = np.zeros(n_tree, dtype=np.int64)
+        offsets[1:] = np.cumsum(leaf_counts)[:-1]
+        self.register_buffer("offsets", torch.from_numpy(offsets).long())
+
+        self.total_vocab_size = int(np.sum(leaf_counts))
+        self.global_tree_embed = nn.Embedding(self.total_vocab_size, emb_dim)
+
+        self.spec_embed = nn.Sequential(
+            nn.Linear(spec_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+        self.leaf_agg_proj = nn.Sequential(
+            nn.Linear(emb_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=n_head,
+            batch_first=True,
+            dropout=dropout
+        )
+        self.gate = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Sigmoid()
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, n_class)
+        )
+
+    def forward(self, spec_x, leaf_index):
+        global_leaf_index = leaf_index + self.offsets
+        global_leaf_index = torch.clamp(global_leaf_index, min=0, max=self.total_vocab_size - 1)
+
+        tree_emb_stack = self.global_tree_embed(global_leaf_index)
+        tree_emb_mean = torch.mean(tree_emb_stack, dim=1)
+
+        leaf_feat = self.leaf_agg_proj(tree_emb_mean)
+        spec_feat = self.spec_embed(spec_x)
+
+        q = spec_feat.unsqueeze(1)
+        k = leaf_feat.unsqueeze(1)
+        v = leaf_feat.unsqueeze(1)
+        attn_out, _ = self.cross_attn(q, k, v)
+        attn_out = attn_out.squeeze(1)
+
+        gate_w = self.gate(torch.cat([spec_feat, attn_out], dim=1))
+        fused = gate_w * spec_feat + (1 - gate_w) * attn_out
+        return self.classifier(fused)
+
+
+# ===================== 辅助功能函数 =====================
+def get_leaf_batch_pred(model, X, num_classes, batch=16384):
+    """批量高效提取 LightGBM 的叶子节点索引矩阵。"""
+    leaf_list = []
+    n = X.shape[0]
+    for s in range(0, n, batch):
+        e = min(s + batch, n)
+        blk = model.predict(X[s:e, :], pred_leaf=True, num_threads=1)
+        blk_slim = blk[:, ::num_classes]
+        leaf_list.append(blk_slim)
+    return np.vstack(leaf_list)
+
+
+def load_artifacts(save_dir, device, num_classes):
+    """加载训练产物（ML Pipeline 权重与 GBCA Checkpoint）。"""
+    ml_path = os.path.join(save_dir, "ml_pipeline.pkl")
+    gbca_path = os.path.join(save_dir, "gbca_checkpoint.pth")
+
+    if not os.path.exists(ml_path):
+        raise FileNotFoundError(f"ML Pipeline artifact not found: {ml_path}")
+    if not os.path.exists(gbca_path):
+        raise FileNotFoundError(f"GBCA Checkpoint artifact not found: {gbca_path}")
+
+    logging.info(f"Loading Machine Learning Pipeline from: {ml_path}")
+    ml_pack = joblib.load(ml_path)
+    scaler = ml_pack["scaler"]
+    lgb_model = ml_pack["lgb"]
+    xgb_model = ml_pack["xgb"]
+    rf_model = ml_pack["rf"]
+    band_names = ml_pack["band_names"]
+
+    logging.info(f"Loading GBCA Deep Learning Model Checkpoint from: {gbca_path}")
+    gbca_ckpt = torch.load(gbca_path, map_location=device)
+
+    spec_dim = gbca_ckpt["spec_dim"]
+    n_tree = gbca_ckpt["n_tree"]
+    max_leaf_list = gbca_ckpt["max_leaf_list"]
+    emb_dim = gbca_ckpt["emb_dim"]
+    hidden_dim = gbca_ckpt["hidden_dim"]
+    n_head = gbca_ckpt["num_heads"]
+    dropout = gbca_ckpt["dropout"]
+
+    gbca_net = GBCA_Emb_Fast(
+        spec_dim=spec_dim,
+        n_tree=n_tree,
+        max_leaf_list=max_leaf_list,
+        emb_dim=emb_dim,
+        hidden_dim=hidden_dim,
+        n_class=num_classes,
+        dropout=dropout,
+        n_head=n_head
+    ).to(device)
+
+    gbca_net.load_state_dict(gbca_ckpt["state_dict"])
+    gbca_net.eval()
+
+    return scaler, lgb_model, xgb_model, rf_model, gbca_net, band_names
+
+
+# ===================== 主推理预测流程 =====================
+def main(args):
+    # 环境配置
+    os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
+    seed_everything(args.seed)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    logging.info(f"Computation Device: {device}")
+
+    # 1. 加载模型与 Pipeline 权重
+    scaler, lgb_model, xgb_model, rf_model, gbca_net, band_names = load_artifacts(
+        args.save_dir, device, args.num_classes
+    )
+
+    # 归一化融合权重
+    w_arr = np.array(args.weights, dtype=np.float32)
+    w_arr /= np.sum(w_arr)
+    w_gbca, w_lgb, w_xgb, w_rf = w_arr
+    logging.info(f"Normalized Ensemble Weights [GBCA, LGB, XGB, RF]: {np.round(w_arr, 4)}")
+
+    # 2. 获取栅格与矢量坐标元数据
+    with rasterio.open(args.img_path) as src_ref:
+        height, width = src_ref.height, src_ref.width
+        crs, transform = src_ref.crs, src_ref.transform
+        num_bands_img = src_ref.count
+
+    if num_bands_img != len(band_names):
+        logging.warning(f"Image band count ({num_bands_img}) mismatches training band count ({len(band_names)})!")
+
+    # 读取矢量掩膜
+    shapes = []
+    if args.mask_shp and os.path.exists(args.mask_shp):
+        logging.info(f"Loading vector boundary shapefile for masking: {args.mask_shp}")
+        gdf = gpd.read_file(args.mask_shp, encoding="utf-8")
+        if gdf.crs != crs:
+            logging.info(f"Reprojecting Shapefile CRS from {gdf.crs} to Raster CRS {crs}")
+            gdf = gdf.to_crs(crs)
+        shapes = [geom for geom in gdf.geometry if geom is not None and not geom.is_empty]
+    else:
+        logging.info("No valid Shapefile boundary mask provided. Predicting whole image extent.")
+
+    # 准备输出 Profile
+    out_profile = {
+        "driver": "GTiff",
+        "height": height,
+        "width": width,
+        "count": 1,
+        "dtype": "uint8",
+        "crs": crs,
+        "transform": transform,
+        "nodata": args.out_nodata,
+        "compress": "lzw"
+    }
+
+    os.makedirs(os.path.dirname(os.path.abspath(args.output_path)), exist_ok=True)
+
+    # 3. 分块推理引擎（Tile-by-Tile Stream Processing）
+    logging.info(f"Starting Tile-based Raster Inference (Block Size: {args.block_size}x{args.block_size})...")
+
+    with rasterio.open(args.img_path) as src_in, rasterio.open(args.output_path, "w", **out_profile) as dst_out:
+        blocks_y = int(np.ceil(height / args.block_size))
+        blocks_x = int(np.ceil(width / args.block_size))
+        total_blocks = blocks_y * blocks_x
+
+        pbar = tqdm(total=total_blocks, desc="Inference Progress")
+
+        for y_off in range(0, height, args.block_size):
+            win_h = min(args.block_size, height - y_off)
+            for x_off in range(0, width, args.block_size):
+                win_w = min(args.block_size, width - x_off)
+                window = Window(x_off, y_off, win_w, win_h)
+
+                # 生成矢量掩膜
+                if len(shapes) > 0:
+                    win_transform = rasterio.windows.transform(window, transform)
+                    shp_mask = geometry_mask(
+                        shapes,
+                        out_shape=(win_h, win_w),
+                        transform=win_transform,
+                        all_touched=False,
+                        invert=True
+                    )
+                else:
+                    shp_mask = np.ones((win_h, win_w), dtype=bool)
+
+                # 读取像元数据
+                block_data = src_in.read(window=window)
+                C, H_blk, W_blk = block_data.shape
+                pixels = block_data.transpose(1, 2, 0).reshape(-1, C).astype(np.float32)
+
+                # 识别有效像元
+                max_invalid = int(C * args.nodata_ratio)
+                invalid_count = np.sum(np.isnan(pixels) | (pixels == args.nodata_val), axis=1)
+                valid_mask = (invalid_count <= max_invalid) & shp_mask.reshape(-1)
+
+                pred_label = np.full(H_blk * W_blk, fill_value=args.out_nodata, dtype=np.uint8)
+
+                if np.any(valid_mask):
+                    valid_pixels = pixels[valid_mask]
+                    valid_pixels[np.isnan(valid_pixels)] = 0.0
+
+                    # 统一标准化
+                    pixels_scaled = scaler.transform(valid_pixels)
+
+                    # 机器学习（LGBM / XGB / RF）概率估计
+                    p_lgb = lgb_model.predict_proba(pixels_scaled)
+                    p_xgb = xgb_model.predict_proba(pixels_scaled)
+                    p_rf = rf_model.predict_proba(pixels_scaled)
+
+                    # 提取决策树叶子节点索引
+                    leaf_idx = get_leaf_batch_pred(lgb_model, pixels_scaled, args.num_classes, batch=args.batch_size)
+
+                    # GBCA 深度神经网络概率估计
+                    p_gbca_list = []
+                    num_valid = pixels_scaled.shape[0]
+
+                    with torch.no_grad():
+                        for i in range(0, num_valid, args.batch_size):
+                            end_i = min(i + args.batch_size, num_valid)
+                            spec_batch = torch.from_numpy(pixels_scaled[i:end_i]).float().to(device)
+                            leaf_batch = torch.from_numpy(leaf_idx[i:end_i]).long().to(device)
+
+                            logits = gbca_net(spec_batch, leaf_batch)
+                            probs = F.softmax(logits, dim=1).cpu().numpy()
+                            p_gbca_list.append(probs)
+
+                    p_gbca = np.vstack(p_gbca_list)
+
+                    # 概率加权融合
+                    prob_sum = (w_gbca * p_gbca) + (w_lgb * p_lgb) + (w_xgb * p_xgb) + (w_rf * p_rf)
+                    pred_label[valid_mask] = np.argmax(prob_sum, axis=1).astype(np.uint8)
+
+                # 写入栅格结果
+                pred_2d = pred_label.reshape(H_blk, W_blk)
+                dst_out.write(pred_2d[np.newaxis, ...], window=window)
+
+                pbar.update(1)
+                gc.collect()
+
+        pbar.close()
+
+    logging.info(f"\nSuccessfully generated Ensemble classification output to: {args.output_path}")
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="GBCA Ensemble Network Inference Pipeline")
+
+    # 路径参数
+    parser.add_argument('--img_path', type=str, default='./data/satellite_image.tif',
+                        help='Path to multispectral raster TIF for inference')
+    parser.add_argument('--mask_shp', type=str, default='./data/val_data.shp',
+                        help='Path to vector boundary polygon shapefile (Optional)')
+    parser.add_argument('--save_dir', type=str, default='./checkpoint_output',
+                        help='Directory containing trained models and pipeline artifacts')
+    parser.add_argument('--output_path', type=str, default='./checkpoint_output/predicted_map.tif',
+                        help='Path to output classification GTiff raster')
+
+    # 模型与特征参数
+    parser.add_argument('--weights', nargs=4, type=float, default=[0.40, 0.25, 0.20, 0.15],
+                        help='Ensemble weights order: [GBCA, LGB, XGB, RF]')
+    parser.add_argument('--num_classes', type=int, default=4, help='Number of target classification categories')
+    parser.add_argument('--nodata_val', type=float, default=-9999.0, help='Raster Input NoData value')
+    parser.add_argument('--nodata_ratio', type=float, default=0.3, help='Threshold ratio of invalid pixels allowed')
+    parser.add_argument('--out_nodata', type=int, default=255, help='Output raster NoData label')
+
+    # 计算与性能参数
+    parser.add_argument('--block_size', type=int, default=512, help='Raster tiling block size for streaming inference')
+    parser.add_argument('--batch_size', type=int, default=16384, help='Batch size for neural network GPU prediction')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
+
+    parsed_args = parser.parse_args()
+    main(parsed_args)
