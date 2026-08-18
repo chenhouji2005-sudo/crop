@@ -10,7 +10,7 @@ An end-to-end framework for multi-temporal remote sensing agricultural land-cove
 crop/
 ├── Featurebuild                # GEE feature extraction & fusion pipeline script
 ├── train.py                    # GBCA & Ensemble model training & cross-validation script
-├── predict.py         # Tile-based inference & classification map generation script
+├── predict.py                  # Tile-based inference & classification map generation script
 ├── requirements.txt            # Python dependencies list
 ├── .gitignore                  # Git ignore rule file
 └── README.md                   # Project documentation
