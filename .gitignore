@@ -1,0 +1,11 @@
+*.tif
+*.pth
+*.pkl
+
+checkpoint_output/
+__pycache__/
+.vscode/
+
+data/*.shp
+
+!data/test_example.tif
