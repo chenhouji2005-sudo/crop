@@ -1,0 +1,405 @@
+"""
+GEE, Multi-Temporal Agricultural Feature Extraction & Fusion Pipeline
+Remote Sensing Agricultural Land-Cover Classification Scheme.
+
+GitHub Release / Modular Version
+"""
+
+import math
+import argparse
+import ee
+
+
+# ===================== GEE Initialization Function =====================
+def init_gee(project_id):
+    """
+    Initialize Google Earth Engine API with the specified Cloud Project ID.
+    """
+    try:
+        ee.Initialize(project=project_id)
+        print(f"GEE Initialization Successful! Cloud Project ID: {project_id}")
+    except Exception as e:
+        print(f"GEE Initialization Failed: {e}")
+        print("Attempting re-authentication...")
+        try:
+            ee.Authenticate()
+            ee.Initialize(project=project_id)
+            print(f"GEE Re-authentication & Initialization Successful!")
+        except Exception as auth_err:
+            print(f"Fatal Error: Could not initialize GEE: {auth_err}")
+            raise auth_err
+
+
+# ===================== Feature Extraction Functions =====================
+def mask_s2_improved(image):
+    """
+    Sentinel-2 Cloud & Shadow Masking (QA60 + SCL Dual Mask)
+    """
+    qa = image.select('QA60')
+    cloud_bit = 1 << 10
+    cirrus_bit = 1 << 11
+    qa_mask = (
+        qa.bitwiseAnd(cloud_bit).eq(0).And(qa.bitwiseAnd(cirrus_bit).eq(0))
+    )
+
+    scl = image.select('SCL')
+    scl_mask = (
+        scl.neq(3)
+        .And(scl.neq(8))
+        .And(scl.neq(9))
+        .And(scl.neq(10))
+        .And(scl.neq(11))
+    )
+
+    final_mask = qa_mask.And(scl_mask)
+    return image.updateMask(final_mask)
+
+
+def preprocess_s2(image):
+    """
+    Sentinel-2 Preprocessing: Band Selection & Surface Reflectance Scaling
+    """
+    return (
+        image.select(
+            ['B2', 'B3', 'B4', 'B7', 'B8', 'B11'],
+            ['B', 'G', 'R', 'RE3', 'NIR', 'SWIR1'],
+        )
+        .divide(10000)
+        .float()
+    )
+
+
+def preprocess_s1(image):
+    """
+    Sentinel-1 SAR Preprocessing & Index Calculation
+    """
+    vv_db = image.select('VV')
+    vh_db = image.select('VH')
+
+    vv_lin = ee.Image(10).pow(vv_db.divide(10))
+    vh_lin = ee.Image(10).pow(vh_db.divide(10))
+    span_lin = vv_lin.add(vh_lin).add(1e-6)
+
+    diff_db = vv_db.subtract(vh_db).rename('VVVH_DIFF')
+    ratio_lin = vv_lin.divide(vh_lin).rename('VVVH_RATIO')
+    rvi = ee.Image(4).multiply(vh_lin).divide(span_lin).rename('RVI')
+
+    span_db = span_lin.log10().multiply(10).rename('SPAN')
+    vh_vv_ratio = vh_lin.divide(vv_lin).rename('VH_VV_RATIO')
+    radar_ndi = vv_lin.subtract(vh_lin).divide(span_lin).rename('RADAR_NDI')
+
+    p_vv = vv_lin.divide(span_lin)
+    p_vh = vh_lin.divide(span_lin)
+
+    p_vv_safe = p_vv.max(1e-6)
+    p_vh_safe = p_vh.max(1e-6)
+
+    radar_entropy = (
+        p_vv.multiply(p_vv_safe.log())
+        .add(p_vh.multiply(p_vh_safe.log()))
+        .multiply(-1)
+        .divide(math.log(2))
+        .rename('RADAR_ENTROPY')
+    )
+
+    radar_contrast = (
+        vv_lin.subtract(vh_lin).abs().divide(span_lin).rename('RADAR_CONTRAST')
+    )
+
+    return ee.Image.cat([
+        vv_db.rename('VV_db'),
+        vh_db.rename('VH_db'),
+        diff_db,
+        ratio_lin,
+        rvi,
+        span_db,
+        vh_vv_ratio,
+        radar_ndi,
+        radar_entropy,
+        radar_contrast,
+    ]).float()
+
+
+def calc_texture(image, prefix, kernel_radius, scale, offset):
+    """
+    Spatial GLCM & Neighborhood Statistics Features
+    """
+    kernel = ee.Kernel.square(kernel_radius)
+    mean = image.reduceNeighborhood(ee.Reducer.mean(), kernel).rename(f'{prefix}_MEAN')
+    std = image.reduceNeighborhood(ee.Reducer.stdDev(), kernel).rename(f'{prefix}_STD')
+
+    img_safe = image.add(offset).clamp(0, scale * 65535)
+    gray = img_safe.multiply(scale).toUint16().rename('gray')
+    glcm = gray.glcmTexture(size=kernel_radius * 2 + 1)
+
+    contrast = (
+        glcm.select('.*contrast.*')
+        .reduce(ee.Reducer.mean())
+        .rename(f'{prefix}_CONTRAST')
+    )
+    entropy = (
+        glcm.select('.*ent.*')
+        .reduce(ee.Reducer.mean())
+        .rename(f'{prefix}_ENTROPY')
+    )
+    homogeneity = (
+        glcm.select('.*idm.*')
+        .reduce(ee.Reducer.mean())
+        .rename(f'{prefix}_HOMOGENEITY')
+    )
+
+    return ee.Image.cat([mean, std, contrast, entropy, homogeneity])
+
+
+def calc_temporal_stats(stack, band_name, periods_count):
+    """
+    Multi-Temporal Statistical Metrics (Linear Fit, Peak Position, CV)
+    """
+    mean = stack.reduce(ee.Reducer.mean()).rename(f'{band_name}_MEAN')
+    std = stack.reduce(ee.Reducer.stdDev()).rename(f'{band_name}_STD')
+    max_val = stack.reduce(ee.Reducer.max()).rename(f'{band_name}_MAX')
+    min_val = stack.reduce(ee.Reducer.min()).rename(f'{band_name}_MIN')
+    range_val = max_val.subtract(min_val).rename(f'{band_name}_RANGE')
+    cv = std.divide(mean.add(1e-6)).rename(f'{band_name}_CV')
+
+    time_values = list(range(periods_count))
+    ic_list = []
+    band_names = stack.bandNames()
+
+    for t in time_values:
+        y_img = stack.select([band_names.get(t)]).rename('y').toFloat()
+        x_img = ee.Image.constant(t).rename('x').toFloat()
+        ic_list.append(ee.Image.cat([x_img, y_img]))
+
+    times_ic = ee.ImageCollection(ic_list)
+    fit_result = times_ic.reduce(ee.Reducer.linearFit())
+    slope = fit_result.select('scale').rename(f'{band_name}_SLOPE')
+
+    peak_pos = (
+        stack.toArray()
+        .arrayArgmax()
+        .arrayGet([0])
+        .rename(f'{band_name}_PEAK_POS')
+    )
+    return ee.Image.cat([mean, std, max_val, min_val, range_val, cv, slope, peak_pos])
+
+
+def get_period_features(start_date, end_date, prefix, roi, window_extend_days=10):
+    """
+    Single Period Feature Extraction (Optical Indices + SAR)
+    """
+    start = ee.Date(start_date).advance(-window_extend_days, 'day')
+    end = ee.Date(end_date).advance(window_extend_days, 'day')
+
+    s2 = (
+        ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+        .filterBounds(roi)
+        .filterDate(start, end)
+        .map(mask_s2_improved)
+        .map(preprocess_s2)
+    )
+    s2_comp = s2.median()
+
+    B = s2_comp.select('B')
+    G = s2_comp.select('G')
+    R = s2_comp.select('R')
+    RE3 = s2_comp.select('RE3')
+    NIR = s2_comp.select('NIR')
+    SWIR1 = s2_comp.select('SWIR1')
+
+    # Spectral Vegetation Indices
+    NDVI = NIR.subtract(R).divide(NIR.add(R).add(1e-6)).rename('NDVI')
+    SAVI = NIR.subtract(R).multiply(1.5).divide(NIR.add(R).add(0.5)).rename('SAVI')
+    LSWI = NIR.subtract(SWIR1).divide(NIR.add(SWIR1).add(1e-6)).rename('LSWI')
+    NDRE = NIR.subtract(RE3).divide(NIR.add(RE3).add(1e-6)).rename('NDRE')
+
+    EVI = (
+        NIR.subtract(R)
+        .multiply(2.5)
+        .divide(NIR.add(R.multiply(6)).subtract(B.multiply(7.5)).add(1).add(1e-6))
+        .rename('EVI')
+    )
+    CIre = NIR.divide(RE3.add(1e-6)).subtract(1).rename('CIre')
+    NIRv = NDVI.multiply(NIR).rename('NIRv')
+
+    # Yellow Crop / Rapeseed Index
+    NDYI = G.subtract(B).divide(G.add(B).add(1e-6)).rename('NDYI')
+
+    # Phenological Metrics
+    MTCI = NIR.subtract(RE3).divide(RE3.subtract(R).add(1e-6)).rename('MTCI')
+    YI_NDVI_RATIO = NDYI.divide(NDVI.add(1e-6)).rename('YI_NDVI_RATIO')
+    LSWI_EVI = LSWI.divide(EVI.add(1e-6)).rename('LSWI_EVI')
+
+    # Sentinel-1 SAR Integration
+    s1 = (
+        ee.ImageCollection('COPERNICUS/S1_GRD')
+        .filterBounds(roi)
+        .filterDate(start, end)
+        .filter(ee.Filter.eq('instrumentMode', 'IW'))
+        .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+        .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+        .map(preprocess_s1)
+    )
+    s1_comp = s1.median()
+
+    VV_TEXTURE = s1_comp.select('VV_db').reduceNeighborhood(
+        reducer=ee.Reducer.mean(), kernel=ee.Kernel.square(5)
+    ).rename('VV_TEXTURE')
+
+    period_img = ee.Image.cat([
+        B, G, R, RE3, NIR, SWIR1,
+        NDVI, SAVI, LSWI, NDRE, NDYI, EVI, CIre, NIRv,
+        MTCI, YI_NDVI_RATIO, LSWI_EVI,
+        s1_comp.select(['VV_db', 'VH_db', 'VVVH_DIFF', 'VVVH_RATIO', 'RVI']),
+        VV_TEXTURE,
+    ])
+
+    old_names = period_img.bandNames()
+    new_names = old_names.map(lambda n: ee.String(prefix).cat('_').cat(n))
+    return period_img.rename(new_names)
+
+
+# ===================== CLI Argument Parser =====================
+def parse_args():
+    parser = argparse.ArgumentParser(description="GEE Agricultural Feature Extraction Pipeline")
+    parser.add_argument("--project_id", type=str, required=True, help="Google Cloud Project ID")
+    parser.add_argument("--roi_asset", type=str, required=True, help="GEE Asset Path for ROI Shapefile Boundary")
+    parser.add_argument("--output_asset", type=str, required=True, help="Target GEE Asset Path to export raster")
+    parser.add_argument("--task_name", type=str, default="7periods_2023", help="GEE Export Task Description")
+    parser.add_argument("--scale", type=int, default=10, help="Export Spatial Resolution (meters)")
+    parser.add_argument("--window_extend_days", type=int, default=10, help="Date window expansion days")
+    return parser.parse_args()
+
+
+# ===================== Main Pipeline =====================
+def main():
+    args = parse_args()
+
+    # 1. GEE Initialization
+    init_gee(args.project_id)
+
+    # 2. ROI & Bounding Configuration
+    roi = ee.FeatureCollection(args.roi_asset).geometry()
+    roi_buf = roi.buffer(60)
+    export_region = roi.bounds()
+
+    # 3. Multi-temporal Periods (2022 Winter -> 2023 Summer)
+    periods = {
+        'T1': {'start': '2022-12-01', 'end': '2023-01-01'},
+        'T2': {'start': '2023-01-01', 'end': '2023-02-01'},
+        'T3': {'start': '2023-02-01', 'end': '2023-03-01'},
+        'T4': {'start': '2023-03-01', 'end': '2023-04-01'},  # Rapeseed Peak Flowering
+        'T5': {'start': '2023-04-01', 'end': '2023-05-01'},
+        'T6': {'start': '2023-05-01', 'end': '2023-06-01'},  # Wheat Grain Filling / Harvest
+        'T7': {'start': '2023-06-01', 'end': '2023-07-01'},
+    }
+
+    print("Building 7-period baseline features...\n")
+    period_keys = list(periods.keys())
+    period_images = []
+    for key in period_keys:
+        s = periods[key]['start']
+        e = periods[key]['end']
+        img = get_period_features(s, e, key, roi, window_extend_days=args.window_extend_days)
+        period_images.append(img)
+        print(f"Synthesized features for period {key}")
+
+    base = ee.Image.cat(period_images)
+
+    # 4. Temporal Statistical Features
+    print("\nCalculating Temporal Statistics...")
+
+    def build_stack(base_img, band):
+        sel_list = [base_img.select(f'{tk}_{band}') for tk in period_keys]
+        return ee.Image.cat(sel_list)
+
+    ndvi_stack = build_stack(base, 'NDVI')
+    evi_stack = build_stack(base, 'EVI')
+    vv_stack = build_stack(base, 'VV_db')
+    vh_stack = build_stack(base, 'VH_db')
+    rvi_stack = build_stack(base, 'RVI')
+    ndyi_stack = build_stack(base, 'NDYI')
+
+    n_periods = len(period_keys)
+    ndvi_stats = calc_temporal_stats(ndvi_stack, 'NDVI', n_periods)
+    evi_stats = calc_temporal_stats(evi_stack, 'EVI', n_periods)
+    vv_stats = calc_temporal_stats(vv_stack, 'VV', n_periods)
+    vh_stats = calc_temporal_stats(vh_stack, 'VH', n_periods)
+    rvi_stats = calc_temporal_stats(rvi_stack, 'RVI', n_periods)
+    ndyi_stats = calc_temporal_stats(ndyi_stack, 'NDYI', n_periods)
+
+    # Consecutive Phase Difference Features
+    d_ndyi_34 = base.select('T4_NDYI').subtract(base.select('T3_NDYI')).rename('D_NDYI_34')
+    d_ndyi_45 = base.select('T5_NDYI').subtract(base.select('T4_NDYI')).rename('D_NDYI_45')
+    d_ndvi_12 = base.select('T2_NDVI').subtract(base.select('T1_NDVI')).rename('D_NDVI_12')
+    d_ndvi_23 = base.select('T3_NDVI').subtract(base.select('T2_NDVI')).rename('D_NDVI_23')
+
+    temporal_features = ee.Image.cat([
+        ndvi_stats, evi_stats, vv_stats, vh_stats, rvi_stats, ndyi_stats,
+        d_ndvi_12, d_ndvi_23, d_ndyi_34, d_ndyi_45,
+    ])
+
+    # 5. Spatial Texture Features
+    print("Calculating Spatial Texture Features...")
+    ndvi_median = ndvi_stack.reduce(ee.Reducer.median())
+    vv_median = vv_stack.reduce(ee.Reducer.median())
+    vh_median = vh_stack.reduce(ee.Reducer.median())
+
+    ndvi_3x3 = calc_texture(ndvi_median, 'NDVI_3x3', 1, 10000, 1)
+    vv_3x3 = calc_texture(vv_median, 'VV_3x3', 1, 100, 30)
+    vh_3x3 = calc_texture(vh_median, 'VH_3x3', 1, 100, 30)
+
+    texture_features = ee.Image.cat([ndvi_3x3, vv_3x3, vh_3x3])
+
+    # 6. Plastic Film/Greenhouse Target Features
+    print("Calculating Greenhouse/Plastic Film Indices...")
+    t1_B = base.select('T1_B')
+    t1_G = base.select('T1_G')
+    t1_R = base.select('T1_R')
+    t1_NIR = base.select('T1_NIR')
+    t1_SWIR1 = base.select('T1_SWIR1')
+
+    plastic_idx = t1_SWIR1.subtract(t1_B).divide(t1_SWIR1.add(t1_B).add(1e-6)).rename('PLASTIC_IDX')
+    ndbi = t1_SWIR1.subtract(t1_NIR).divide(t1_SWIR1.add(t1_NIR).add(1e-6)).rename('NDBI')
+    bsi = (
+        t1_SWIR1.add(t1_R)
+        .subtract(t1_NIR.add(t1_B))
+        .divide(t1_SWIR1.add(t1_R).add(t1_NIR.add(t1_B)).add(1e-6))
+        .rename('BSI')
+    )
+    brightness = (
+        t1_B.multiply(0.3037)
+        .add(t1_G.multiply(0.2793))
+        .add(t1_R.multiply(0.4743))
+        .add(t1_NIR.multiply(0.5585))
+        .add(t1_SWIR1.multiply(0.5082))
+        .rename('BRIGHTNESS')
+    )
+
+    membrane_features = ee.Image.cat([plastic_idx, ndbi, bsi, brightness])
+
+    # 7. Feature Fusion & Export Setup
+    fusion = (
+        ee.Image.cat([base, temporal_features, texture_features, membrane_features])
+        .clip(roi_buf)
+        .float()
+    )
+
+    task = ee.batch.Export.image.toAsset(
+        image=fusion,
+        description=args.task_name,
+        assetId=args.output_asset,
+        region=export_region,
+        crs='EPSG:4326',
+        scale=args.scale,
+        maxPixels=1e13,
+    )
+
+    task.start()
+
+    print(f"\nGEE Export Task [{args.task_name}] successfully submitted!")
+    print(f"Target Asset Path: {args.output_asset}")
+
+
+if __name__ == '__main__':
+    main()
